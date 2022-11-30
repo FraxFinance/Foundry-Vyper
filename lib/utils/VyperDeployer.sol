@@ -59,8 +59,11 @@ contract VyperDeployer {
         ///@notice compile the Vyper contract and return the bytecode
         bytes memory _bytecode = cheatCodes.ffi(cmds);
 
+
         //add args to the deployment bytecode
         bytes memory bytecode = abi.encodePacked(_bytecode, args);
+
+        require(bytecode.length > 0, "Vyper compilation failed");
 
         ///@notice deploy the bytecode with the create instruction
         address deployedAddress;
