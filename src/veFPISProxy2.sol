@@ -46,22 +46,11 @@ interface IERC20 {
 /// @dev Users cannot withdraw their veFPIS while they have a balance in the proxy
 contract veFPISProxy is Owned {
 
-    // struct App {
-    //     uint256 maxUsageAllowedPercent; // Usage: how much of a user's locked FPIS an app controls // TODO: consider packing, determine precision
-    //     uint256 maxSlashAllowedPercent; // Percent of usage which may be slashed / taken as fees.
-    //     bool custodiesFunds; // Percent of usage which may be held in custody by the app
-    // }
-
-    // struct User {
-    //     // address[] appsInUse;
-    //     mapping(address=>uint256) appToUsage;
-    // }
-
-    // /// @notice Maps an app address to a struct containing its parameters
-    // mapping(address=>App) private addrToApp;
-
-    // /// @notice Maps a user address to a struct containing their permitted apps and usage in each app
-    // mapping(address=>User) private addrToUser;
+    struct App {
+        uint256 maxAllowancePercent; // What percent of a user's locked FPIS an app is able to control at max, 1e6 precision
+        mapping (adddress=>uint256) userToAllowance; // The max amount of a user's FPIS which an app is able to control
+        mapping (address=>uint256) userToFPISinApp; // The amount of a user's FPIS which is currently custodied in the app
+    }
 
     uint256 private constant PRECISION = 1e6;
 
@@ -72,44 +61,12 @@ contract veFPISProxy is Owned {
     /// @notice True if an app has been whitelisted to use the proxy
     mapping(address=>bool) public isApp;
 
-    /// @notice Maps a user's address to a mapping from app address to how much of their locked veFPIS balance is being used by that app
-    mapping(address=>mapping(address=>uint256)) private userToAppToUsage;
-
-    // @notice Maps an app's address to the percent of a user's locked veFPIS balance which may be used by that app (1e6 precision)
-    mapping(address=>uint256) private maxUsageAllowedPercent;
-
-    /// @notice all apps which have ever been whitelisted
-    address[] allApps;
-
+    mapping(address=>App) private addrToApp;
 
     modifier onlyApp() {
         require(isApp[msg.sender], "Only callable by app");
         _;
     }
-
-    // /// @notice Ensures that after a function call, the user's usage + slash potential is not greater than their locked balance
-    // modifier noDoubleSpend(address userAddr) {
-    //     _;
-
-    //     int128 locked_int128 = veFPIS.locked__amount(_user);
-    //     assert(locked_int128 >= 0, "FATAL: NEGATIVE LOCKED BALANCE"); // Should never happen
-    //     uint256 locked = uint256(int256(locked_int128)); // Needs intermediate conversion since Solidity 0.8.0
-
-    //     uint256 userFPISInProxy = veFPIS.user_fpis_in_proxy(userAddr);
-    //     uint256 numApps = allApps.length;
-
-    //     uint256 sumUsage = 0;
-    //     uint256 sumSlashPotential = 0;
-
-    //     for(uint i = 0; i < numApps; i++) {
-    //         address appAddr = allApps[i];
-    //         sumUsage = getUserAppUsage(appAddr, userAddr);
-    //         sumSlashPotential = getUserAppPotentialSlash(appAddr, userAddr);
-    //     }
-
-    //     require(sumUsage == userFPISInProxy, "Proxy vs veFPIS accounting mismatch"); // TODO: code should never reach here, is this overkill? If so, remove summation from loop (gas), might be useful for security on apps
-    //     require(sumUsage + sumSlashPotential <= locked, "Insufficient veFPIS balance to cover total usage + potential slash");        
-    // }
 
     constructor(address _owner, address _timelock, address _veFPIS) Owned(_owner) {
         veFPIS = IveFPIS(_veFPIS);
@@ -118,26 +75,21 @@ contract veFPISProxy is Owned {
     }
 
     /// @notice Whitelists an app to use the proxy and sets the max usage and max slash 
-    function addApp(address appAddr, uint256 newMaxUsageAllowedPercent) external onlyOwner {
+    function addApp(address appAddr, uint256 maxAllowancePercent) external onlyOwner {
         require(!isApp[appAddr], "veFPISProxy: app already added");
         isApp[_appAddr] = true;
-        maxUsageAllowedPercent[appAddr] = newMaxUsageAllowedPercent;
-        
-        // addrToApp[appAddr].maxUsageAllowedPercent = maxUsageAllowedPercent;
-        // addrToApp[appAddr].maxSlashAllowedPercent = maxSlashAllowedPercent;
-        // addrToApp[appAddr].custodiesFunds = custodiesFunds;
-
-        allApps.push(appAddr);
+        // allApps.push(appAddr);
+        addrToApp[appAddr].maxAllowancePercent = maxAllowancePercent;
     }
 
-    // TODO: Is this safe?
-    /// @notice Sets the max usage and max slash allowed for an app
-    function setAppMaxUsage(address appAddr, uint256 newMaxUsageAllowedPercent) external onlyOwner {
+    // TODO: ensure this is safe, should be since you can still repay if > allowed
+    /// @notice Sets the max usage and max slash allowed for an app, reducing max usage restricts users to only exit but will not cause loss of funds
+    function setAppMaxAllowancePercent(address appAddr, uint256 maxAllowancePercent) external onlyOwner {
         require(isApp[msg.sender], "veFPISProxy: app nonexistant");
-        maxUsageAllowedPercent[appAddr] = newMaxUsageAllowedPercent;
+        addrToApp[appAddr].maxAllowancePercent = maxAllowancePercent;
     }
 
-    // TODO: Decide if this can be safely implemented
+    // // TODO: Is this safe? (traps user funds in app), preferred is probably just to set max allowance to 0
     // /// @notice Removes an app from the whitelist and sets its max allowances to 0
     // function removeApp(address appAddr) external onlyOwner {
     //     require(isApp[appAddr], "veFPISProxy: app nonexistant");
@@ -145,84 +97,72 @@ contract veFPISProxy is Owned {
     //     maxUsageAllowedPercent[appAddr] = 0;
     // }
 
-    function getAppMaxUsage(address appAddr) external view returns (uint256) {
-        return maxUsageAllowedPercent[appAddr];
+    function getAppMaxAllowancePercent(address appAddr) external view returns (uint256) {
+        return addrToApp[appAddr].maxAllowancePercent;
     }
 
-    function getUserAppUsage(address userAddr, address appAddr) external view returns (uint256) {
-        return userToAppToUsage[userAddr][appAddr];
+    function getUserFPISinApp(address userAddr, address appAddr) external view returns (uint256) {
+        return addrToApp[appAddr].userToFPISinApp[userAddr];
     }
 
     function setTimelock(address _timelock) external onlyOwner {
         timelock = _timelock;
     }
 
-    /// @notice Returns the max number of a specific user's locked FPIS that a specific app may control
-    function getUserAppMaxUsage(address userAddr, address appAddr) public view {
-        return (maxUsageAllowedPercent[appAddr] * veFPIS.locked__amount(userAddr) / PRECISION);
-    }
+    // /// @notice Returns the max number of a specific user's locked FPIS that a specific app may control
+    // function getUserAppMaxUsage(address userAddr, address appAddr) public view {
+    //     return (maxUsageAllowedPercent[appAddr] * veFPIS.locked__amount(userAddr) / PRECISION);
+    // }
 
     /// @notice Moves funds from veFPIS.vy to an app and increases usage
-    /// @dev uses noDoubleSpend modifier to ensure that the user's usage + slash potential is not greater than their locked balance
-    function sendToApp(address appAddr, address userAddr, uint256 amountFPIS) public onlyApp {
-        require (isApp[appAddr], "veFPISProxy: app nonexistant");
-        require(getUserAppUsage(userAddr, appAddr) + amountFPIS <= getUserAppMaxUsage(userAddr, appAddr), "veFPISProxy: usage exceeds limit");
+    function appTransferFromVeFPIS(address userAddr, uint256 amountFPIS) public onlyApp {
+        App storage app = addrToApp[msg.sender];
+        require(app.userToFPISinApp[userAddr] + amountFPIS <= app.maxAllowancePercent * veFPIS.locked__amount(userAddr) / PRECISION, "veFPISProxy: usage exceeds limit");
 
-       veFPIS.transfer_to_app(userAddr, appAddr, amountFPIS); //TODO: deal with int vs uint on _veFPISAmount
-       FPIS.transfer(appAddr, amountFPIS);
+        veFPIS.transfer_to_app(userAddr, appAddr, amountFPIS); //TODO: deal with int vs uint on _veFPISAmount
 
-       userToAppToUsage[userAddr][appAddr] += amountFPIS;
+        app.userToFPISinApp[userAddr] += amountFPIS;
     }
 
-    /// @notice Moves funds from an app to veFPIS.vy and 
-    /// @dev App must first approve the proxy to spend the amount of FPIS to payback
-    function payback(address userAddr, address appAddr, uint256 amountFPIS, bool isLiquidation) public onlyApp {
-        require (isApp[_appAddr], "veFPISProxy: app nonexistant");
-        require (getUserAppUsage(userAddr, appAddr) >= amountFPIS, "veFPISProxy: payback amount exceeds usage");
+    /// @notice Moves funds from an app to veFPIS.vy
+    /// @dev App must first approve the proxy to spend the amount of FPIS to return
+    function appReturnToVeFPIS(address userAddr, uint256 amountFPIS, bool isLiquidation) public onlyApp {
+        App storage app = addrToApp[msg.sender];
+        require (app.userToFPISinApp[userAddr] >= amountFPIS, "veFPISProxy: payback amount exceeds usage");
 
-        veFPIS.transfer_from_app(userAddr, appAddr, _transfer_amt); //TODO: Uint to int
+        veFPIS.transfer_from_app(userAddr, msg.sender, _transfer_amt); //TODO: Uint to int
 
-        userToAppToUsage[userAddr][appAddr] -= amountFPIS;
+        app.userToFPISinApp[userAddr] -= amountFPIS;
     }
 
-    function appAdd(address userAddr, address appAddr, uint256 amountFPIS) public onlyApp {
-        require (isApp[_appAddr], "veFPISProxy: app nonexistant");
+    function appAdd(address userAddr, uint256 amountFPIS) public onlyApp {
+        App storage app = addrToApp[msg.sender];
+        
         veFPIS.proxy_add(userAddr, amountFPIS);
-        userToAppToUsage[userAddr][appAddr] += amountFPIS; //TODO: what if this exceeds max allowed?
+
+        uint256 userAppAllowance = app.userToAllowance[userAddr];
+        uint256 userMaxAppAllowance = app.maxAllowancePercent * veFPIS.locked__amount(userAddr) / PRECISION;
+        uint256 cap;
+
+        if (userAppAllowance >= userMaxAppAllowance) {
+            cap = userMaxAppAllowance;
+        } else {
+            cap = userAppAllowance;
+        }
+
+        uint256 newFPISinApp = app.userToFPISinApp[userAddr] += amountFPIS; //TODO ensure += has a uint return type
+
+        if (newFPISinApp > cap) {
+            uint256 surplus = newFPISinApp - cap;
+            veFPIS.transfer_from_app(userAddr, msg.sender, surplus); //TODO: Uint to int
+            app.userToFPISinApp[userAddr] -= surplus;
+        }
     }
 
-    function appSlasb(address userAddr, address appAddr, uint256 amountFPIS) public onlyApp {
-        require (isApp[_appAddr], "veFPISProxy: app nonexistant");
-        require (userToAppToUsage[userAddr][appAddr] >= amountFPIS, "veFPISProxy: slash amount exceeds usage");
+    function appSlash(address userAddr, uint256 amountFPIS) public onlyApp {
+        App storage app = addrToApp[msg.sender];
+        require (app.userToFPISinApp[userAddr] >= amountFPIS, "veFPISProxy: slash amount exceeds user FPIS in app");
         veFPIS.proxy_slash(userAddr, amountFPIS);
-        userToAppToUsage[userAddr][appAddr] -= amountFPIS;
+        app.userToFPISinApp[userAddr] -= amountFPIS;
     }
-
-    // /// @notice Slashes a user and pays down their usage
-    // /// @dev Slashed amount remains in the app's custody
-    // /// @dev App must first approve the proxy to spend the amount of FPIS to payback
-    // /// @dev a raw slash without a corresponding payback can result in double spend issues as locked balance decreases but maximum potential slash does not
-    // /// @dev the only way to decrease user_fpis_in_proxy in veFPIS.vy is via payback, which makes this necessary
-    // function slashUsage(address user, address appAddr, uint256 amountFPIS, bool isFee, bool isLiquidation) public onlyApp {
-    //     require (isApp[_appAddr], "veFPISProxy: app nonexistant");
-    //     App storage targetApp = addrToApp[_appAddr];
-    //     User storage targetUser = addrToUser[_user];
-
-    //     require (getUserAppPotentialSlash(appAddr, userAddr) >= amountFPIS, "veFPISProxy: slash amount exceeds potential slash");
-
-    //     if(isFee) {
-    //         veFPIS.proxy_pbk_liq_slsh(user, 0, 0, amountFPIS, 0);
-    //     } else {
-    //         veFPIS.proxy_pbk_liq_slsh(user, 0, 0, 0, amountFPIS);
-    //     }
-
-    //     if(amountFPIS > getUserAppUsage(appAddr, userAddr)) {
-    //         payback(user, appAddr, targetUser.appToUsage[appAddr], isLiquidation);
-    //     } else {
-    //         payback(user, appAddr, amountFPIS, isLiquidation);
-    //     }
-    // }
-    
-    // // TODO: Naked slash can result in double spend, do we need to enable anyways?
-    // // function slash(address _user, address _appAddr, uint256 _veFPISAmount) public{}
 }
