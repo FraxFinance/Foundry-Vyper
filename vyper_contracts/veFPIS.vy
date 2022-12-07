@@ -88,11 +88,10 @@ CREATE_LOCK_TYPE: constant(int128) = 0
 INCREASE_LOCK_AMOUNT: constant(int128) = 1
 INCREASE_UNLOCK_TIME: constant(int128) = 2
 USER_WITHDRAW: constant(int128) = 3
-PROXY_TRANSFER: constant(int128) = 4
-PROXY_NON_LIQ_PAYBACK: constant(int128) = 5
-PROXY_LIQ_PAYBACK: constant(int128) = 6
-PROXY_LIQ_FEE: constant(int128) = 7
-PROXY_SLASH: constant(int128) = 8
+TRANSFER_FROM_APP: constant(int128) = 4
+TRANSFER_TO_APP: constant(int128) = 5
+PROXY_ADD: constant(int128) = 6
+PROXY_SLASH: constant(int128) = 7
 
 event CommitOwnership:
     admin: address
@@ -118,17 +117,24 @@ event Supply:
     prevSupply: uint256
     supply: uint256
 
-event TransferToProxy:
+event TransferToApp:
     staker_addr: indexed(address)
-    proxy_addr: indexed(address)
+    app_addr: indexed(address)
     transfer_amt: uint256
 
-event ProxyPaybackLiqOrSlash:
+event TransferFromApp:
+    app_addr: indexed(address)
+    staker_addr: indexed(address)
+    transfer_amt: uint256
+
+event ProxyAdd:
     staker_addr: indexed(address)
     proxy_addr: indexed(address)
-    payback_amt: uint256
-    liquidation_amt: uint256
-    liquidation_fee: uint256
+    add_amt: uint256
+
+event ProxySlash:
+    staker_addr: indexed(address)
+    proxy_addr: indexed(address)
     slash_amt: uint256
 
 event SmartWalletCheckerComitted:
@@ -140,11 +146,17 @@ event SmartWalletCheckerApplied:
 event EmergencyUnlockToggled:
     emergencyUnlockActive: bool
 
-event ProxyTransferTosToggled:
-    proxyTransferTosEnabled: bool
+event ProxyTransferFromsToggled:
+    appTransferFromsEnabled: bool
 
-event ProxyPaybackLiqOrSlashsToggled:
-    ProxyPaybackLiqOrSlashsEnabled: bool
+event ProxyTransferTosToggled:
+    appTransferTosEnabled: bool
+
+event ProxyAddsToggled:
+    proxyAddsEnabled: bool
+
+event ProxySlashesToggled:
+    proxySlashesEnabled: bool
 
 event LendingProxySet:
     proxy_address: address
@@ -180,17 +192,19 @@ user_point_epoch: public(HashMap[address, uint256]) # user -> last week epoch th
 slope_changes: public(HashMap[uint256, int128])  
                                                  
 # Misc
-proxyTransferTosEnabled: public(bool) # Whether FPIS can be lent to a proxy or not
-ProxyPaybackLiqOrSlashsEnabled: public(bool) # Whether the proxy can back pay and/or liquidate the user's position
+appTransferFromsEnabled: public(bool) # Whether FPIS can be received from apps or not
+appTransferTosEnabled: public(bool) # Whether FPIS can be sent to apps or not
+proxyAddsEnabled: public(bool) # Whether the proxy can add to the user's position
+proxySlashesEnabled: public(bool) # Whether the proxy can slash the user's position
 
 # Emergency Unlock
 emergencyUnlockActive: public(bool)
 
 # Proxies (allow withdrawal / deposits for lending protocols, etc.)
-lending_proxy: public(address) # Set by admin. Can only be one at any given time
-historical_proxies: public(HashMap[address, bool]) # Set by admin. Used for paying back / liquidating after the main lending_proxy changes
+current_proxy: public(address) # Set by admin. Can only be one at any given time
+historical_proxies: public(HashMap[address, bool]) # Set by admin. Used for paying back / liquidating after the main current_proxy changes
 staker_whitelisted_proxy: public(HashMap[address, address])  # user -> proxy. Set by user
-user_fpis_in_proxy: public(HashMap[address, uint256]) # user -> amount held in proxy
+user_proxy_balance: public(HashMap[address, uint256]) # user -> amount held in proxy
 
 # ERC20 related
 name: public(String[64])
@@ -221,8 +235,10 @@ def __init__(token_addr: address, _name: String[64], _symbol: String[32], _versi
     self.point_history[0].blk = block.number
     self.point_history[0].ts = block.timestamp
     self.point_history[0].fpis_amt = 0
-    self.proxyTransferTosEnabled = True
-    self.ProxyPaybackLiqOrSlashsEnabled = True
+    self.appTransferFromsEnabled = True
+    self.appTransferTosEnabled = True
+    self.proxyAddsEnabled = True
+    self.proxySlashesEnabled = True
 
     _decimals: uint256 = ERC20(token_addr).decimals()
     assert _decimals <= 255
@@ -530,8 +546,8 @@ def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBala
         if (new_locked.amount < old_locked.amount):
             last_point.fpis_amt -= convert(old_locked.amount - new_locked.amount, uint256)
 
-            # Subtract the bias if you are liquidating after expiry
-            if ((flag == PROXY_LIQ_FEE or flag == PROXY_SLASH) and (new_locked.end < block.timestamp)):
+            # Subtract the bias if you are slashing after expiry
+            if ((flag == PROXY_SLASH) and (new_locked.end < block.timestamp)):
                 last_point.bias -= old_locked.amount
 
             # Remove the offset
@@ -724,81 +740,104 @@ def _withdraw(staker_addr: address, addr_out: address, locked_in: LockedBalance,
     log Supply(supply_before, supply_before - value)
 
 @external
-@nonreentrant('lock')
-def proxy_pbk_liq_slsh(
+@nonreentrant('proxy')
+def proxy_add(
     _staker_addr: address, 
-    _non_liq_payback_amt: uint256, 
-    _liq_payback_amt: uint256,
-    _liq_fee_amt: uint256,
-    _slash_amt: uint256
+    _add_amt: uint256, 
 ):
     """
-    @notice Proxy pays back `_staker_addr`'s loan and increases the veFPIS base / bias. 
-    @dev Proxy can also slash for any future / optional reason
-    @dev Also optionally liquidates part of the staker's core veFPIS position, sometimes taking a fee
-    @dev Logic for the proxy is not present in this contract
+    @notice Proxy increaes `_staker_addr`'s veFPIS base / bias. Usually due to rewards on an app
     @param _staker_addr The target veFPIS staker address to act on
-    @param _non_liq_payback_amt Payback amount not during a liquidation, for example, if directed by the user
-    @param _liq_payback_amt Payback amount during a liquidation
-    @param _liq_fee_amt Liquidation fee being taken from the user's core balance
-    @param _slash_amt Amount that the proxy is slashing the user
     """
     # Make sure that the function isn't disabled, and also that the proxy is valid
-    assert (self.ProxyPaybackLiqOrSlashsEnabled), "Currently disabled"
-    assert (msg.sender == self.lending_proxy or self.historical_proxies[msg.sender]), "Proxy not whitelisted [admin level]"
+    assert (self.proxyAddsEnabled), "Currently disabled"
+    assert (msg.sender == self.current_proxy or self.historical_proxies[msg.sender]), "Proxy not whitelisted [admin level]"
     assert (msg.sender == self.staker_whitelisted_proxy[_staker_addr]), "Proxy not whitelisted [staker level]"
 
+    # NOTE: IF YOU ACTUALLY WANT TO TRANSFER TOKENS, YOU CAN USE
+    # _deposit_for() instead of below
+
     # Get the staker's locked position and proxy balance
-    _locked: LockedBalance = self.locked[_staker_addr]
-    _proxy_balance: uint256 = self.user_fpis_in_proxy[_staker_addr]
+    old_locked: LockedBalance = self.locked[_staker_addr]
+    _proxy_balance: uint256 = self.user_proxy_balance[_staker_addr]
 
     # Validate some things
-    assert _locked.amount > 0, "No existing lock found"
-    assert (_non_liq_payback_amt + _liq_payback_amt + _slash_amt) > 0, "Amounts must be non-zero"
+    assert old_locked.amount > 0, "No existing lock found"
+    assert (_add_amt) > 0, "Amount must be non-zero"
 
-    # Same code for normal and liquidation paybacks
-    if (_non_liq_payback_amt > 0 or _liq_payback_amt > 0):
-        # Make sure there is actually something to pay back
-        assert _proxy_balance > 0, "Nothing to pay back for this proxy"
+    # Increase the proxy balance 
+    self.user_proxy_balance[_staker_addr] += _add_amt
 
-        # Cannot pay back more than what was borrowed
-        assert (_non_liq_payback_amt + _liq_payback_amt) <= _proxy_balance, "Trying to pay back too much"
+    # Note original data
+    supply_before: uint256 = self.supply
 
-        # Proxy gives back FPIS
-        # NOTE: Proxy needs to approve() to the veFPIS contract first
-        assert ERC20(self.token).transferFrom(msg.sender, self, _non_liq_payback_amt + _liq_payback_amt)
-
-        # Lower the loaned balance 
-        self.user_fpis_in_proxy[_staker_addr] -= (_non_liq_payback_amt + _liq_payback_amt)
-
-    # Handle the normal payback checkpoint
-    if (_non_liq_payback_amt > 0):
-        # Checkpoint
-        self._checkpoint(_staker_addr, _locked, _locked, PROXY_NON_LIQ_PAYBACK)
-
-    # Handle liquidation fee
-    # Proxy takes a fee from the user's core position
-    if (_liq_fee_amt > 0): 
-        # # Checkpoint
-        # self._checkpoint(_staker_addr, _locked, _locked, PROXY_LIQ_PAYBACK)
-
-        # # Refresh the _locked for the fee
-        # _locked = self.locked[_staker_addr]
-
-        # Withdraw the fee from the staker's core position and give it to the proxy
-        self._withdraw(_staker_addr, msg.sender, _locked, convert(_liq_fee_amt, int128), PROXY_LIQ_FEE)
+    # Get the staker's balance and the total supply
+    new_locked: LockedBalance = old_locked # Will be incremented soon
     
-        # Refresh the _locked in case there is a slash later
-        _locked = self.locked[_staker_addr]
+    # Increase the supply
+    self.supply += _add_amt
 
-    # Handle a slash (proxy takes FPIS from the user's veFPIS position)
-    if (_slash_amt > 0): 
-        # Withdraw the amount to slash from the staker's core position and give it to the proxy
-        # Proxy will own this amount now
-        self._withdraw(_staker_addr, msg.sender, _locked, convert(_slash_amt, int128), PROXY_SLASH)
+    # Add to an existing lock
+    new_locked.amount += convert(_add_amt, int128)
+    self.locked[_staker_addr] = new_locked
 
-    log ProxyPaybackLiqOrSlash(_staker_addr, msg.sender, _non_liq_payback_amt, _liq_payback_amt, _liq_fee_amt, _slash_amt)
+    # Checkpoint:
+    self._checkpoint(_staker_addr, old_locked, new_locked, PROXY_ADD)
 
+    # Events
+    log ProxyAdd(_staker_addr, msg.sender, _add_amt)
+    log Supply(supply_before, supply_before + _add_amt)
+
+
+@external
+@nonreentrant('proxy')
+def proxy_slash(
+    _staker_addr: address, 
+    _slash_amt: uint256, 
+):
+    """
+    @notice Proxy increaes `_staker_addr`'s veFPIS base / bias. Usually due to rewards on an app
+    @param _staker_addr The target veFPIS staker address to act on
+    """
+    # Make sure that the function isn't disabled, and also that the proxy is valid
+    assert (self.proxyAddsEnabled), "Currently disabled"
+    assert (msg.sender == self.current_proxy or self.historical_proxies[msg.sender]), "Proxy not whitelisted [admin level]"
+    assert (msg.sender == self.staker_whitelisted_proxy[_staker_addr]), "Proxy not whitelisted [staker level]"
+
+    # NOTE: IF YOU ACTUALLY WANT TO TRANSFER TOKENS, YOU CAN USE
+    # _deposit_for() instead of below
+
+    # Get the staker's locked position and proxy balance
+    old_locked: LockedBalance = self.locked[_staker_addr]
+    _proxy_balance: uint256 = self.user_proxy_balance[_staker_addr]
+
+    # Validate some things
+    assert old_locked.amount > 0, "No existing lock found"
+    assert (_slash_amt) > 0, "Amount must be non-zero"
+
+    # Decrease the proxy balance 
+    assert (self.user_proxy_balance[_staker_addr] >= _slash_amt), "Trying to slash too much"
+    self.user_proxy_balance[_staker_addr] -= _slash_amt
+
+    # Note original data
+    supply_before: uint256 = self.supply
+
+    # Get the staker's balance and the total supply
+    new_locked: LockedBalance = old_locked # Will be decremented soon
+    
+    # Decrease the supply
+    self.supply -= _slash_amt
+
+    # Remove from an existing lock
+    new_locked.amount -= convert(_slash_amt, int128)
+    self.locked[_staker_addr] = new_locked
+
+    # Checkpoint:
+    self._checkpoint(_staker_addr, old_locked, new_locked, PROXY_SLASH)
+
+    # Events
+    log ProxyAdd(_staker_addr, msg.sender, _slash_amt)
+    log Supply(supply_before, supply_before - _slash_amt)
 
 @external
 @nonreentrant('lock')
@@ -813,49 +852,79 @@ def withdraw():
 
     # Validate some things
     assert ((block.timestamp >= _locked.end) or (self.emergencyUnlockActive)), "The lock didn't expire"
-    assert (self.user_fpis_in_proxy[msg.sender] == 0), "Outstanding FPIS in proxy. Have proxy use proxy_pbk_liq_slsh"
+    assert (self.user_proxy_balance[msg.sender] == 0), "Outstanding FPIS in proxy"
     
     # Allow the withdrawal
     self._withdraw(msg.sender, msg.sender, _locked, _locked.amount, USER_WITHDRAW)
 
-
 @external
-@nonreentrant('lock')
-def transfer_to_proxy(_staker_addr: address, _transfer_amt: int128):
+@nonreentrant('proxy')
+def transfer_from_app(_staker_addr: address, _app_addr: address, _transfer_amt: int128):
     """
-    @notice Transfer tokens for `_staker_addr` to the proxy, to be loaned or otherwise used
+    @notice Transfer tokens from a proxy-connected app to the veFPIS contract
     @dev Only possible for whitelisted proxies, both by the admin and by the staker
+    @dev Only proxy and staker are checked, not the app, so make sure to do that at the proxy level
+    @dev Make sure app does the approval to veFPIS first
     """
     # Make sure that the function isn't disabled, and also that the proxy is valid
-    assert (self.proxyTransferTosEnabled), "Currently disabled"
-    assert (msg.sender == self.lending_proxy), "Proxy not whitelisted [admin level]"
+    assert (self.appTransferFromsEnabled), "Currently disabled"
+    assert (msg.sender == self.current_proxy or self.historical_proxies[msg.sender]), "Proxy not whitelisted [admin level]"
     assert (msg.sender == self.staker_whitelisted_proxy[_staker_addr]), "Proxy not whitelisted [staker level]"
     
     # Get the staker's locked position
     _locked: LockedBalance = self.locked[_staker_addr]
+    assert _locked.amount > 0, "No existing lock found"
 
-    # Make sure the position isn't expired
-    assert (block.timestamp < _locked.end), "No transfers after expiration"
-
+    # Note the amount to be moved to the veFPIS contract 
     _value: uint256 = convert(_transfer_amt, uint256)
-    _locked_amt: uint256 = convert(_locked.amount, uint256)
+    assert (self.user_proxy_balance[_staker_addr] >= _value), "Trying to transfer back too much"
+    self.user_proxy_balance[_staker_addr] -= _value
 
-    # Make sure total user transfers do not surpass user locked balance
-    assert (_value + self.user_fpis_in_proxy[_staker_addr] <= _locked_amt), "Amount exceeds locked balance"
-
-    # Note the amount moved to the proxy 
-    self.user_fpis_in_proxy[_staker_addr] += _value
-
-    # Allow the transfer to the proxy.
-    # This will reduce the user's veFPIS balance
-    # self._withdraw(_staker_addr, msg.sender, _locked, _transfer_amt, PROXY_TRANSFER)
+    # Allow the transfer to the app.
     # This will not reduce the user's veFPIS balance
-    assert ERC20(self.token).transfer(msg.sender, _value)
+    assert ERC20(self.token).transferFrom(_app_addr, self, _value)
 
     # Checkpoint
-    self._checkpoint(_staker_addr, _locked, _locked, PROXY_TRANSFER)
+    self._checkpoint(_staker_addr, _locked, _locked, TRANSFER_FROM_APP)
 
-    log TransferToProxy(_staker_addr, msg.sender, _value)
+    log TransferFromApp(_app_addr, _staker_addr, _value)
+
+@external
+@nonreentrant('proxy')
+def transfer_to_app(_staker_addr: address, _app_addr: address, _transfer_amt: int128):
+    """
+    @notice Transfer tokens for `_staker_addr` to a proxy-connected app directly, to be loaned or otherwise used
+    @dev Only possible for whitelisted proxies, both by the admin and by the staker
+    @dev Only proxy and staker are checked, not the app, so make sure to do that at the proxy level
+    """
+    # Make sure that the function isn't disabled, and also that the proxy is valid
+    assert (self.appTransferTosEnabled), "Currently disabled"
+    assert (msg.sender == self.current_proxy or self.historical_proxies[msg.sender]), "Proxy not whitelisted [admin level]"
+    assert (msg.sender == self.staker_whitelisted_proxy[_staker_addr]), "Proxy not whitelisted [staker level]"
+    
+    # Get the staker's locked position
+    _locked: LockedBalance = self.locked[_staker_addr]
+    _locked_amt: uint256 = convert(_locked.amount, uint256)
+
+    # Make sure the position isn't expired (no outbound transfers after expiry)
+    assert (block.timestamp < _locked.end), "No transfers after expiration"
+
+    # Note the amount to be moved to the app 
+    _value: uint256 = convert(_transfer_amt, uint256)
+    self.user_proxy_balance[_staker_addr] += _value
+
+    # Make sure total user transfers do not surpass user locked balance
+    assert (_value + self.user_proxy_balance[_staker_addr] <= _locked_amt), "Amount exceeds locked balance"
+
+    # Allow the transfer to the app.
+    # This will not reduce the user's veFPIS balance
+    assert ERC20(self.token).transfer(_app_addr, _value)
+
+    # Checkpoint
+    self._checkpoint(_staker_addr, _locked, _locked, TRANSFER_TO_APP)
+
+    log TransferToApp(_staker_addr, _app_addr, _value)
+
 
 
 @internal
@@ -1097,26 +1166,48 @@ def toggleEmergencyUnlock():
     log EmergencyUnlockToggled(self.emergencyUnlockActive)
 
 @external
-def toggleProxyTransferTos():
+def toggleTransferFromApp():
     """
-    @dev Toggles the ability to send FPIS to proxies
+    @dev Toggles the ability to receive FPIS from apps
     """
     assert msg.sender == self.admin  # dev: admin only
-    self.proxyTransferTosEnabled = not (self.proxyTransferTosEnabled)
+    self.appTransferFromsEnabled = not (self.appTransferFromsEnabled)
     self._checkpoint(empty(address), empty(LockedBalance), empty(LockedBalance), 0)
 
-    log ProxyTransferTosToggled(self.proxyTransferTosEnabled)
+    log ProxyTransferFromsToggled(self.appTransferFromsEnabled)
 
 @external
-def toggleProxyPaybackLiqOrSlashs():
+def toggleTransferToApp():
     """
-    @dev Toggles the ability for the proxy to pay back or liquidate a user 
+    @dev Toggles the ability to send FPIS to apps
     """
     assert msg.sender == self.admin  # dev: admin only
-    self.ProxyPaybackLiqOrSlashsEnabled = not (self.ProxyPaybackLiqOrSlashsEnabled)
+    self.appTransferTosEnabled = not (self.appTransferTosEnabled)
     self._checkpoint(empty(address), empty(LockedBalance), empty(LockedBalance), 0)
 
-    log ProxyPaybackLiqOrSlashsToggled(self.ProxyPaybackLiqOrSlashsEnabled)
+    log ProxyTransferTosToggled(self.appTransferTosEnabled)
+
+@external
+def toggleProxyAdds():
+    """
+    @dev Toggles the ability for the proxy to add FPIS credit to user 
+    """
+    assert msg.sender == self.admin  # dev: admin only
+    self.proxyAddsEnabled = not (self.proxyAddsEnabled)
+    self._checkpoint(empty(address), empty(LockedBalance), empty(LockedBalance), 0)
+
+    log ProxyAddsToggled(self.proxyAddsEnabled)
+
+@external
+def toggleProxySlashes():
+    """
+    @dev Toggles the ability for the proxy to subtract FPIS from a user 
+    """
+    assert msg.sender == self.admin  # dev: admin only
+    self.proxySlashesEnabled = not (self.proxySlashesEnabled)
+    self._checkpoint(empty(address), empty(LockedBalance), empty(LockedBalance), 0)
+
+    log ProxySlashesToggled(self.proxySlashesEnabled)
 
 @external
 def adminSetProxy(_proxy: address):
@@ -1125,7 +1216,7 @@ def adminSetProxy(_proxy: address):
     @param _proxy The lending proxy address 
     """
     assert msg.sender == self.admin, "Admin only"  # dev: admin only
-    self.lending_proxy = _proxy
+    self.current_proxy = _proxy
     self.historical_proxies[_proxy] = True
 
     log LendingProxySet(_proxy)
@@ -1134,7 +1225,8 @@ def adminSetProxy(_proxy: address):
 def adminToggleHistoricalProxy(_proxy: address):
     """
     @dev Admin can manipulate a historical proxy if needed (normally done automatically in adminSetProxy)
-    @dev This is needed if the main lending_proxy changes and and old proxy needs to pay back or liquidate a user
+    @dev This is needed if the main current_proxy changes and and old proxy needs to pay back or liquidate a user
+    @dev Or if there is something wrong with an older proxy
     @param _proxy The lending proxy address 
     """
     assert msg.sender == self.admin, "Admin only"  # dev: admin only
@@ -1151,8 +1243,8 @@ def stakerSetProxy(_proxy: address):
     @param _proxy The address the staker will let withdraw/deposit for them 
     """
     # Do some checks
-    assert (_proxy == empty(address) or self.lending_proxy == _proxy), "Proxy not whitelisted [admin level]"
-    assert (self.user_fpis_in_proxy[msg.sender] == 0), "Outstanding FPIS in proxy. Have proxy use proxy_pbk_liq_slsh"
+    assert (_proxy == empty(address) or self.current_proxy == _proxy), "Proxy not whitelisted [admin level]"
+    assert (self.user_proxy_balance[msg.sender] == 0), "Outstanding FPIS in proxy"
 
     # Set the proxy
     self.staker_whitelisted_proxy[msg.sender] = _proxy
